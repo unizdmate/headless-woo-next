@@ -47,6 +47,7 @@ apps/storefront/
       cart/items/[key]/route.ts
       cart/coupons/route.ts
       cart/shipping-rates/route.ts
+      cart/shipping-rates/select/route.ts
       checkout/route.ts
     (shop)/
       cart/page.tsx
@@ -212,8 +213,10 @@ PATCH  /api/cart/items/:key        { quantity }
 DELETE /api/cart/items/:key
 POST   /api/cart/coupons           { code }  # primjena kupona
 DELETE /api/cart/coupons           { code }  # uklanjanje kupona
-POST   /api/cart/shipping-rates    { packageId, rateId } # prema Store API inputu
+POST   /api/cart/shipping-rates    { shipping_address } # adresa i dohvat aktualnih rateova
+POST   /api/cart/shipping-rates/select { packageId, rateId }
 GET    /api/checkout               # WooCommerce checkout draft/podaci
+PUT    /api/checkout               # payment method / order note update
 POST   /api/checkout               # finalni Store API checkout
 ```
 
@@ -438,3 +441,1754 @@ Prije produkcije potvrdi:
 - [Next.js Route Handlers](https://nextjs.org/docs/app/api-reference/file-conventions/route)
 
 API ugovore i gateway behavior provjeri ponovno pri nadogradnji WooCommercea ili payment/auth plugina; Store API ekstenzije i gateway payloadi ovise o instaliranim verzijama.
+
+## 14. Implementacija korak po korak: funkcionalni primjeri koda
+
+Primjeri ispod zajedno čine minimalan BFF za guest cart i bankovni transfer (`bacs`). U monorepu prilagodi samo workspace package name i konfigurirane alias putanje. Primjer namjerno ne uključuje gateway-specifičan frontend SDK: kartična plaćanja i OIDC zahtijevaju dodatni provider/plugin ugovor, opisan u odgovarajućim koracima.
+
+### 14.1. Env konfiguracija i tipovi
+
+**Datoteka: `apps/storefront/src/server/config.ts`**
+
+```ts
+const storeApiUrl = process.env.WC_STORE_API_URL;
+const appOrigin = process.env.APP_ORIGIN;
+
+if (!storeApiUrl || !appOrigin) {
+  throw new Error("WC_STORE_API_URL and APP_ORIGIN must be configured");
+}
+
+const parsedStoreApiUrl = new URL(storeApiUrl);
+const parsedAppOrigin = new URL(appOrigin);
+
+if (
+  parsedStoreApiUrl.protocol !== "https:" &&
+  process.env.NODE_ENV === "production"
+) {
+  throw new Error("WC_STORE_API_URL must use HTTPS in production");
+}
+if (
+  !["https:", "http:"].includes(parsedAppOrigin.protocol) ||
+  (process.env.NODE_ENV === "production" && parsedAppOrigin.protocol !== "https:")
+) {
+  throw new Error("APP_ORIGIN must use HTTPS in production");
+}
+
+export const config = {
+  storeApiUrl: parsedStoreApiUrl.toString().replace(/\/+$/, ""),
+  appOrigin: parsedAppOrigin.origin,
+};
+```
+
+`.env.local` lokacija je `apps/storefront/.env.local`:
+
+```env
+WC_STORE_API_URL=https://cms.example.com/wp-json/wc/store/v1
+APP_ORIGIN=http://localhost:3000
+AUTH_SECRET=replace-with-at-least-32-random-bytes
+WP_HEADLESS_AUTH_URL=https://cms.example.com/wp-json/headless/v1/login
+```
+
+`AUTH_SECRET` se koristi u primjeru JWT sessiona ispod. Generiraj vrijednost lokalno pomoću `openssl rand -base64 32`; produkcijsku vrijednost dostavi kroz secret manager, nikad je ne commitaj.
+
+**Datoteka: `apps/storefront/tsconfig.json` — relevantan dio**
+
+Zadrži postojeći `extends` prema `packages/configuration` i spoji ove path alias-e s postojećim compiler options:
+
+```json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  }
+}
+```
+
+**Datoteka: `packages/commerce/package.json` — relevantan dio**
+
+```json
+{
+  "name": "@repo/commerce",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
+```
+
+Package name koristi i u aplikacijskim importima. Ako monorepo builda `dist/`, izvezi `dist/index.js` i odgovarajuće type declarations umjesto `.ts` izvora.
+
+**Datoteka: `apps/storefront/next.config.ts`**
+
+```ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  transpilePackages: ["@repo/commerce", "@repo/ui"],
+};
+
+export default nextConfig;
+```
+
+Ako `packages/ui` ne koristi Next.js/React source transpilation ili već ima ispravno buildani output, prilagodi `transpilePackages` postojećem build procesu.
+
+**Datoteka: `packages/commerce/src/store-api/types.ts`**
+
+```ts
+export type CartItem = {
+  key: string;
+  id: number;
+  name: string;
+  quantity: number;
+};
+
+export type Cart = {
+  items: CartItem[];
+  items_count: number;
+  totals: {
+    total_price: string;
+    currency_code: string;
+    currency_minor_unit: number;
+  };
+  payment_methods?: string[];
+  shipping_rates?: Array<{
+    package_id: number;
+    shipping_rates: Array<{
+      rate_id: string;
+      name: string;
+      selected: boolean;
+    }>;
+  }>;
+};
+
+export type CartVariation = {
+  attribute: string;
+  value: string;
+};
+
+export type AddCartItemInput = {
+  id: number;
+  quantity: number;
+  variation?: CartVariation[];
+};
+
+export type Address = {
+  first_name: string;
+  last_name: string;
+  address_1: string;
+  address_2?: string;
+  city: string;
+  state?: string;
+  postcode: string;
+  country: string;
+  email?: string;
+  phone?: string;
+};
+
+export type CheckoutInput = {
+  billing_address: Address;
+  shipping_address: Address;
+  payment_method: string;
+  payment_data?: Array<{ key: string; value: string | number | boolean }>;
+  customer_note?: string;
+  expected_total?: string;
+};
+
+export type Checkout = {
+  order_id: number;
+  status: string;
+  payment_method: string;
+  payment_result: {
+    payment_status: string;
+    redirect_url: string;
+  } | null;
+};
+```
+
+Ovi su namjerno minimalni tipovi za polja koja UI/BFF koristi; proširi ih kada implementiraš dodatna Store API polja. Runtime validacija ispod ostaje obavezna jer TypeScript tipovi ne validiraju HTTP JSON.
+
+### 14.2. WooCommerce Store API client
+
+**Datoteka: `packages/commerce/src/store-api/client.ts`**
+
+```ts
+export type StoreApiResult<T> = {
+  data: T;
+  cartToken?: string;
+};
+
+type StoreApiErrorBody = {
+  code?: string;
+  message?: string;
+};
+
+export class StoreApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly responseBody?: unknown,
+    readonly cartToken?: string
+  ) {
+    super(message);
+    this.name = "StoreApiError";
+  }
+}
+
+type StoreApiRequest = {
+  baseUrl: string;
+  path: string;
+  method?: "GET" | "POST" | "PUT";
+  cartToken?: string;
+  body?: unknown;
+};
+
+export async function storeApiRequest<T>({
+  baseUrl,
+  path,
+  method = "GET",
+  cartToken,
+  body,
+}: StoreApiRequest): Promise<StoreApiResult<T>> {
+  const normalizedBase = `${baseUrl.replace(/\/+$/, "")}/`;
+  const normalizedPath = path.replace(/^\/+/, "");
+  const url = new URL(normalizedPath, normalizedBase);
+
+  if (url.origin !== new URL(normalizedBase).origin) {
+    throw new Error("Store API path escaped configured origin");
+  }
+
+  const headers = new Headers({ Accept: "application/json" });
+  if (cartToken) headers.set("Cart-Token", cartToken);
+  if (body !== undefined) headers.set("Content-Type", "application/json");
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: "no-store",
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  const responseCartToken = response.headers.get("Cart-Token") ?? undefined;
+  const raw = await response.text();
+  let data: unknown;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    throw new StoreApiError(
+      "WooCommerce returned invalid JSON",
+      502,
+      undefined,
+      undefined,
+      responseCartToken
+    );
+  }
+
+  if (!response.ok) {
+    const record =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : undefined;
+    const errorBody: StoreApiErrorBody = {
+      ...(typeof record?.code === "string" ? { code: record.code } : {}),
+      ...(typeof record?.message === "string"
+        ? { message: record.message }
+        : {}),
+    };
+    throw new StoreApiError(
+      errorBody?.message ?? "WooCommerce Store API request failed",
+      response.status,
+      errorBody?.code,
+      data,
+      responseCartToken
+    );
+  }
+
+  return { data: data as T, cartToken: responseCartToken };
+}
+```
+
+Ovdje je cast ograničen na granicu nepouzdanog vanjskog JSON-a. U produkciji dodaj runtime response schema validaciju, npr. Zod, prije nego podatke izložiš UI-ju. Nemoj logirati cijeli `StoreApiError` body.
+
+**Datoteka: `packages/commerce/src/store-api/cart.ts`**
+
+```ts
+import { storeApiRequest } from "./client";
+import type { AddCartItemInput, Cart } from "./types";
+
+export function getCart(baseUrl: string, cartToken?: string) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart",
+    cartToken,
+  });
+}
+
+export function addCartItem(
+  baseUrl: string,
+  input: AddCartItemInput,
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/add-item",
+    method: "POST",
+    cartToken,
+    body: input,
+  });
+}
+
+export function updateCartItem(
+  baseUrl: string,
+  input: { key: string; quantity: number },
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/update-item",
+    method: "POST",
+    cartToken,
+    body: input,
+  });
+}
+
+export function removeCartItem(
+  baseUrl: string,
+  key: string,
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/remove-item",
+    method: "POST",
+    cartToken,
+    body: { key },
+  });
+}
+
+export function updateCustomer(
+  baseUrl: string,
+  input: { billing_address?: unknown; shipping_address?: unknown },
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/update-customer",
+    method: "POST",
+    cartToken,
+    body: input,
+  });
+}
+
+export function selectShippingRate(
+  baseUrl: string,
+  input: { packageId: number; rateId: string },
+  cartToken?: string
+) {
+  const query = new URLSearchParams({
+    package_id: String(input.packageId),
+    rate_id: input.rateId,
+  });
+
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: `cart/select-shipping-rate?${query}`,
+    method: "POST",
+    cartToken,
+  });
+}
+```
+
+**Datoteka: `packages/commerce/src/store-api/checkout.ts`**
+
+```ts
+import { storeApiRequest } from "./client";
+import type { Checkout, CheckoutInput } from "./types";
+
+export function getCheckout(baseUrl: string, cartToken?: string) {
+  return storeApiRequest<Checkout>({
+    baseUrl,
+    path: "checkout",
+    cartToken,
+  });
+}
+
+export function submitCheckout(
+  baseUrl: string,
+  input: CheckoutInput,
+  cartToken?: string
+) {
+  return storeApiRequest<Checkout>({
+    baseUrl,
+    path: "checkout",
+    method: "POST",
+    cartToken,
+    body: input,
+  });
+}
+
+export function updateCheckout(
+  baseUrl: string,
+  input: {
+    payment_method?: string;
+    order_notes?: string;
+    additional_fields?: Record<string, unknown>;
+  },
+  cartToken?: string
+) {
+  return storeApiRequest<Checkout>({
+    baseUrl,
+    path: "checkout",
+    method: "PUT",
+    cartToken,
+    body: input,
+  });
+}
+```
+
+**Datoteka: `packages/commerce/src/index.ts`**
+
+```ts
+export * from "./store-api/cart";
+export * from "./store-api/checkout";
+export * from "./store-api/client";
+export type {
+  AddCartItemInput,
+  Address,
+  Cart,
+  CartItem,
+  CartVariation,
+  Checkout,
+  CheckoutInput,
+} from "./store-api/types";
+```
+
+Postavi package export u `packages/commerce/package.json` tako da Next.js aplikacija uvozi javni API paketa, primjerice `"exports": { ".": "./src/index.ts" }` u monorepu koji transpajlira workspace TypeScript. Ako package gradi `dist/`, exportiraj build output umjesto `src/`.
+
+### 14.3. BFF pomoćne funkcije: cookie, JSON, Origin i odgovori
+
+Pretpostavka primjera: Next.js `apps/storefront/app` koristi alias `@/*` za `apps/storefront/src/*`, a commerce package ime je `@repo/commerce`.
+
+**Datoteka: `apps/storefront/src/server/cart-cookie.ts`**
+
+```ts
+import { cookies } from "next/headers";
+
+export const CART_COOKIE = "cart_token";
+
+const cartCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax" as const,
+  path: "/",
+  maxAge: 60 * 60 * 24 * 2,
+};
+
+export async function readCartToken() {
+  return (await cookies()).get(CART_COOKIE)?.value;
+}
+
+export async function writeCartToken(token?: string) {
+  if (!token) return;
+  (await cookies()).set(CART_COOKIE, token, cartCookieOptions);
+}
+```
+
+`maxAge` primjeru je 48 sati kao WooCommerce session expiry default u tipičnoj konfiguraciji; provjeri stvarnu konfiguraciju i uskladi je. Ako cart-token cookie treba ukloniti, pozovi `(await cookies()).delete(CART_COOKIE)` samo u Route Handleru/Server Actionu i samo prema eksplicitnoj recovery/logout politici.
+
+**Datoteka: `apps/storefront/src/http/api.ts`**
+
+```ts
+import { NextResponse } from "next/server";
+import { config } from "@/server/config";
+import { writeCartToken } from "@/server/cart-cookie";
+import { StoreApiError } from "@repo/commerce";
+
+export function noStoreJson(data: unknown, status = 200) {
+  return NextResponse.json(data, {
+    status,
+    headers: { "Cache-Control": "private, no-store" },
+  });
+}
+
+export async function readJsonObject(
+  request: Request
+): Promise<Record<string, unknown> | null> {
+  const contentLength = Number(request.headers.get("content-length") ?? 0);
+  if (contentLength > 32_000) return null;
+
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    return null;
+  }
+  if (text.length > 32_000) return null;
+
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function requireSameOrigin(request: Request) {
+  const origin = request.headers.get("origin");
+  return origin !== null && origin === config.appOrigin;
+}
+
+export async function downstreamError(error: unknown) {
+  if (error instanceof StoreApiError) {
+    await writeCartToken(error.cartToken);
+    if (error.status === 409) {
+      const body = error.responseBody;
+      const bodyData =
+        typeof body === "object" && body !== null
+          ? (body as Record<string, unknown>).data
+          : undefined;
+      const cart =
+        typeof bodyData === "object" && bodyData !== null
+          ? (bodyData as Record<string, unknown>).cart
+          : undefined;
+      return noStoreJson(
+        {
+          error: "conflict",
+          ...(typeof cart === "object" && cart !== null ? { cart } : {}),
+        },
+        409
+      );
+    }
+
+    const status =
+      error.status >= 400 && error.status < 500
+          ? error.status
+          : 502;
+    return noStoreJson(
+      { error: "commerce_error" },
+      status
+    );
+  }
+
+  const requestId = crypto.randomUUID();
+  console.error("BFF request failed", {
+    requestId,
+    errorName: error instanceof Error ? error.name : "UnknownError",
+  });
+  return noStoreJson({ error: "internal_error", requestId }, 500);
+}
+```
+
+Ograničenje tijela provjerava i `Content-Length` i stvarnu duljinu teksta, jer header može nedostajati. Origin guard je za mutacijske browser rute; redirect callback iz OIDC providera treba validirati preko `state`/`nonce`, ne preko istog same-origin pravila.
+
+**Datoteka: `apps/storefront/src/server/commerce.ts`**
+
+```ts
+import {
+  addCartItem,
+  getCart,
+  getCheckout,
+  removeCartItem,
+  selectShippingRate,
+  submitCheckout,
+  updateCheckout,
+  updateCartItem,
+  updateCustomer,
+} from "@repo/commerce";
+import { config } from "./config";
+
+export const commerce = {
+  getCart: (token?: string) => getCart(config.storeApiUrl, token),
+  addCartItem: (input: Parameters<typeof addCartItem>[1], token?: string) =>
+    addCartItem(config.storeApiUrl, input, token),
+  updateCartItem: (
+    input: Parameters<typeof updateCartItem>[1],
+    token?: string
+  ) => updateCartItem(config.storeApiUrl, input, token),
+  removeCartItem: (key: string, token?: string) =>
+    removeCartItem(config.storeApiUrl, key, token),
+  updateCustomer: (
+    input: Parameters<typeof updateCustomer>[1],
+    token?: string
+  ) => updateCustomer(config.storeApiUrl, input, token),
+  selectShippingRate: (
+    input: Parameters<typeof selectShippingRate>[1],
+    token?: string
+  ) => selectShippingRate(config.storeApiUrl, input, token),
+  getCheckout: (token?: string) => getCheckout(config.storeApiUrl, token),
+  submitCheckout: (
+    input: Parameters<typeof submitCheckout>[1],
+    token?: string
+  ) => submitCheckout(config.storeApiUrl, input, token),
+  updateCheckout: (
+    input: Parameters<typeof updateCheckout>[1],
+    token?: string
+  ) => updateCheckout(config.storeApiUrl, input, token),
+};
+```
+
+**Datoteka: `apps/storefront/src/server/cart-session.ts`**
+
+POST Store API cart operacije trebaju Cart-Token/Nonce. Zato BFF mora inicijalizirati sesiju i za slučaj kada kupac prvi put klikne "Dodaj u košaricu" bez prethodnog otvaranja `/api/cart`.
+
+```ts
+import { commerce } from "./commerce";
+import { readCartToken, writeCartToken } from "./cart-cookie";
+
+export async function ensureCartToken(): Promise<string> {
+  const existing = await readCartToken();
+  if (existing) return existing;
+
+  const initialized = await commerce.getCart();
+  if (!initialized.cartToken) {
+    throw new Error("WooCommerce did not initialize a cart token");
+  }
+  await writeCartToken(initialized.cartToken);
+  return initialized.cartToken;
+}
+```
+
+### 14.4. Cart GET i dodavanje stavke
+
+**Datoteka: `apps/storefront/app/api/cart/route.ts`**
+
+```ts
+import { commerce } from "@/server/commerce";
+import { readCartToken, writeCartToken } from "@/server/cart-cookie";
+import { downstreamError, noStoreJson } from "@/http/api";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  try {
+    const result = await commerce.getCart(await readCartToken());
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+**Datoteka: `apps/storefront/app/api/cart/items/route.ts`**
+
+```ts
+import { commerce } from "@/server/commerce";
+import { writeCartToken } from "@/server/cart-cookie";
+import { ensureCartToken } from "@/server/cart-session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+import type { CartVariation } from "@repo/commerce";
+
+function isVariation(value: unknown): value is CartVariation[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof item.attribute === "string" &&
+        item.attribute.length <= 128 &&
+        typeof item.value === "string" &&
+        item.value.length <= 200
+    ) &&
+    value.length <= 20
+  );
+}
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+
+  const body = await readJsonObject(request);
+  const id = body?.id;
+  const quantity = body?.quantity ?? 1;
+  const variation = body?.variation;
+
+  if (
+    typeof id !== "number" ||
+    !Number.isInteger(id) ||
+    id <= 0 ||
+    typeof quantity !== "number" ||
+    !Number.isInteger(quantity) ||
+    quantity <= 0 ||
+    (variation !== undefined && !isVariation(variation))
+  ) {
+    return noStoreJson({ error: "invalid_cart_item" }, 400);
+  }
+
+  try {
+    const result = await commerce.addCartItem(
+      {
+        id,
+        quantity,
+        ...(variation ? { variation } : {}),
+      },
+      await ensureCartToken()
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+Validacija runtimea ostaje obavezna jer `Request.json()` vraća nepouzdan sadržaj. Za produkciju proširi schema validatorom maksimalne string/array opsege i pravila varijacija prema katalogu.
+
+### 14.5. Količina i uklanjanje stavke
+
+**Datoteka: `apps/storefront/app/api/cart/items/[key]/route.ts`**
+
+```ts
+import { commerce } from "@/server/commerce";
+import { writeCartToken } from "@/server/cart-cookie";
+import { ensureCartToken } from "@/server/cart-session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+
+type RouteContext = { params: Promise<{ key: string }> };
+
+export async function PATCH(request: Request, context: RouteContext) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+
+  const body = await readJsonObject(request);
+  const quantity = body?.quantity;
+  const { key } = await context.params;
+
+  if (
+    !key ||
+    key.length > 128 ||
+    typeof quantity !== "number" ||
+    !Number.isInteger(quantity) ||
+    quantity <= 0
+  ) {
+    return noStoreJson({ error: "invalid_cart_item" }, 400);
+  }
+
+  try {
+    const result = await commerce.updateCartItem(
+      { key, quantity },
+      await ensureCartToken()
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+
+export async function DELETE(request: Request, context: RouteContext) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+
+  const { key } = await context.params;
+  if (!key || key.length > 128) {
+    return noStoreJson({ error: "invalid_cart_item" }, 400);
+  }
+
+  try {
+    const result = await commerce.removeCartItem(key, await ensureCartToken());
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+U Next.js aktualnog App Routera `params` je Promise; ako projekt koristi stariju Next.js verziju, provjeri njezin route typing i prilagodi potpis.
+
+### 14.6. Ažuriranje adrese i odabir shipping ratea
+
+**Datoteka: `apps/storefront/app/api/cart/shipping-rates/route.ts`**
+
+`GET` vraća shipping opcije iz cart stanja. `POST` u ovom BFF ugovoru ažurira dostavnu adresu i osvježava cart; klijent odabire rate u zasebnoj ruti.
+
+```ts
+import { commerce } from "@/server/commerce";
+import { readCartToken, writeCartToken } from "@/server/cart-cookie";
+import { ensureCartToken } from "@/server/cart-session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+
+export async function GET() {
+  try {
+    const result = await commerce.getCart(await readCartToken());
+    await writeCartToken(result.cartToken);
+    return noStoreJson({ shipping_rates: result.data.shipping_rates ?? [] });
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+  const rawAddress = body?.shipping_address;
+
+  if (
+    typeof rawAddress !== "object" ||
+    rawAddress === null ||
+    Array.isArray(rawAddress)
+  ) {
+    return noStoreJson({ error: "invalid_shipping_address" }, 400);
+  }
+
+  const source = rawAddress as Record<string, unknown>;
+  const fields = [
+    "first_name",
+    "last_name",
+    "address_1",
+    "address_2",
+    "city",
+    "state",
+    "postcode",
+    "country",
+  ] as const;
+  const shippingAddress: Record<string, string> = {};
+  for (const field of fields) {
+    const value = source[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.length > 200) {
+      return noStoreJson({ error: "invalid_shipping_address" }, 400);
+    }
+    shippingAddress[field] = value;
+  }
+  if (!shippingAddress.country || !shippingAddress.postcode) {
+    return noStoreJson({ error: "invalid_shipping_address" }, 400);
+  }
+
+  try {
+    const result = await commerce.updateCustomer(
+      { shipping_address: shippingAddress },
+      await ensureCartToken()
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+**Datoteka: `apps/storefront/app/api/cart/shipping-rates/select/route.ts`**
+
+```ts
+import { commerce } from "@/server/commerce";
+import { writeCartToken } from "@/server/cart-cookie";
+import { ensureCartToken } from "@/server/cart-session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+
+  if (
+    typeof body?.packageId !== "number" ||
+    !Number.isInteger(body.packageId) ||
+    body.packageId < 0 ||
+    typeof body.rateId !== "string" ||
+    body.rateId.length === 0 ||
+    body.rateId.length > 200
+  ) {
+    return noStoreJson({ error: "invalid_shipping_rate" }, 400);
+  }
+
+  try {
+    const result = await commerce.selectShippingRate(
+      { packageId: body.packageId, rateId: body.rateId },
+      await ensureCartToken()
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+WooCommerce prihvaća `package_id` i `rate_id` za `/cart/select-shipping-rate`. Odabir uvijek mora biti jedan od rateova koje je Store API vratio za aktualni cart; WooCommerce je konačni autoritet i može odbiti zastarjeli rate.
+
+### 14.7. Kuponi
+
+**Datoteka: `packages/commerce/src/store-api/coupons.ts`**
+
+```ts
+import { storeApiRequest } from "./client";
+import type { Cart } from "./types";
+
+export function applyCoupon(
+  baseUrl: string,
+  code: string,
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/apply-coupon",
+    method: "POST",
+    cartToken,
+    body: { code },
+  });
+}
+
+export function removeCoupon(
+  baseUrl: string,
+  code: string,
+  cartToken?: string
+) {
+  return storeApiRequest<Cart>({
+    baseUrl,
+    path: "cart/remove-coupon",
+    method: "POST",
+    cartToken,
+    body: { code },
+  });
+}
+```
+
+Dodaj `export * from "./store-api/coupons";` u `packages/commerce/src/index.ts`.
+
+**Datoteka: `apps/storefront/app/api/cart/coupons/route.ts`**
+
+```ts
+import { applyCoupon, removeCoupon } from "@repo/commerce";
+import { config } from "@/server/config";
+import { writeCartToken } from "@/server/cart-cookie";
+import { ensureCartToken } from "@/server/cart-session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+
+async function mutateCoupon(request: Request, remove: boolean) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+  const code = body?.code;
+  if (typeof code !== "string" || code.trim().length === 0 || code.length > 128) {
+    return noStoreJson({ error: "invalid_coupon" }, 400);
+  }
+
+  try {
+    const operation = remove ? removeCoupon : applyCoupon;
+    const result = await operation(
+      config.storeApiUrl,
+      code.trim(),
+      await ensureCartToken()
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+
+export async function POST(request: Request) {
+  return mutateCoupon(request, false);
+}
+
+export async function DELETE(request: Request) {
+  return mutateCoupon(request, true);
+}
+```
+
+### 14.8. UI koji koristi isključivo BFF
+
+**Datoteka: `packages/ui/src/components/cart/Cart.tsx`**
+
+```tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
+type CartView = {
+  items: Array<{ key: string; name: string; quantity: number }>;
+  items_count: number;
+  totals: {
+    total_price: string;
+    currency_code: string;
+    currency_minor_unit: number;
+  };
+};
+
+async function readCart(): Promise<CartView> {
+  const response = await fetch("/api/cart", { cache: "no-store" });
+  if (!response.ok) throw new Error("Košaricu nije moguće učitati.");
+  return response.json() as Promise<CartView>;
+}
+
+export function Cart() {
+  const [cart, setCart] = useState<CartView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void readCart()
+      .then(setCart)
+      .catch(() => setError("Košaricu nije moguće učitati."));
+  }, []);
+
+  async function removeItem(key: string) {
+    setError(null);
+    const response = await fetch(
+      `/api/cart/items/${encodeURIComponent(key)}`,
+      { method: "DELETE" }
+    );
+    if (!response.ok) {
+      const failure: unknown = await response.json();
+      if (
+        response.status === 409 &&
+        typeof failure === "object" &&
+        failure !== null &&
+        "cart" in failure
+      ) {
+        setCart((failure as { cart: CartView }).cart);
+      }
+      setError("Stavku nije moguće ukloniti.");
+      return;
+    }
+    setCart((await response.json()) as CartView);
+  }
+
+  if (error && !cart) return <p role="alert">{error}</p>;
+  if (!cart) return <p>Učitavanje košarice…</p>;
+  if (cart.items.length === 0) return <p>Košarica je prazna.</p>;
+
+  const formattedTotal = formatMinorUnits(
+    cart.totals.total_price,
+    cart.totals.currency_code,
+    cart.totals.currency_minor_unit
+  );
+
+  return (
+    <section>
+      <h1>Košarica</h1>
+      {error && <p role="alert">{error}</p>}
+      <ul>
+        {cart.items.map((item) => (
+          <li key={item.key}>
+            {item.name} × {item.quantity}
+            <button type="button" onClick={() => void removeItem(item.key)}>
+              Ukloni
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p>Broj komada: {cart.items_count}</p>
+      <p>Ukupno: {formattedTotal}</p>
+    </section>
+  );
+}
+
+function formatMinorUnits(value: string, currency: string, minorUnit: number) {
+  if (
+    !/^-?\d+$/.test(value) ||
+    !Number.isInteger(minorUnit) ||
+    minorUnit < 0 ||
+    minorUnit > 3
+  ) {
+    throw new Error("Invalid currency amount from cart API");
+  }
+  const amount = BigInt(value);
+  const negative = amount < 0n;
+  const absolute = negative ? -amount : amount;
+  const scale = 10n ** BigInt(minorUnit);
+  const whole = absolute / scale;
+  const fraction = (absolute % scale).toString().padStart(minorUnit, "0");
+  const formatter = new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency,
+    minimumFractionDigits: minorUnit,
+    maximumFractionDigits: minorUnit,
+  });
+  const wholeForPattern = negative && whole === 0n ? -1n : negative ? -whole : whole;
+  const parts = formatter.formatToParts(wholeForPattern);
+  const digitFormatter = new Intl.NumberFormat(undefined, { useGrouping: false });
+  const localizedFraction = [...fraction]
+    .map((digit) => digitFormatter.format(Number(digit)))
+    .join("");
+
+  return parts
+    .map((part) => {
+      if (part.type === "integer" && negative && whole === 0n) return "0";
+      if (part.type === "fraction") return localizedFraction;
+      return part.value;
+    })
+    .join("");
+}
+```
+
+Formatter koristi `BigInt` za minor-unit vrijednosti i ne radi floating-point aritmetiku. Komponenta ne prima i ne čita Cart-Token.
+
+### 14.9. Aplikacijska sesija i WordPress credential adapter
+
+Sljedeći session primjer koristi potpisani JWT radi samostalnog rada bez dodatnog session-store packagea. Zbog stateless dizajna logout ne opoziva već izdani token prije isteka; za trenutačni revoke koristi server-side session store i zamijeni ovaj primjer. `jose` dodaj kao dependency u `apps/storefront`.
+
+**Datoteka: `apps/storefront/src/auth/session.ts`**
+
+```ts
+import { SignJWT, jwtVerify } from "jose";
+import { cookies } from "next/headers";
+
+const COOKIE_NAME = "app_session";
+const SESSION_SECONDS = 60 * 60 * 24 * 7;
+const rawSecret = process.env.AUTH_SECRET;
+
+if (!rawSecret || new TextEncoder().encode(rawSecret).length < 32) {
+  throw new Error("AUTH_SECRET must contain at least 32 bytes");
+}
+
+const secret = new TextEncoder().encode(rawSecret);
+
+export type AppIdentity = {
+  subject: string;
+  email: string;
+  displayName: string;
+};
+
+export async function createSession(identity: AppIdentity) {
+  const token = await new SignJWT({
+    email: identity.email,
+    name: identity.displayName,
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(identity.subject)
+    .setIssuer("storefront")
+    .setAudience("storefront-web")
+    .setIssuedAt()
+    .setExpirationTime(`${SESSION_SECONDS}s`)
+    .sign(secret);
+
+  (await cookies()).set(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: SESSION_SECONDS,
+  });
+}
+
+export async function getSession(): Promise<AppIdentity | null> {
+  const token = (await cookies()).get(COOKIE_NAME)?.value;
+  if (!token) return null;
+
+  try {
+    const { payload } = await jwtVerify(token, secret, {
+      algorithms: ["HS256"],
+      issuer: "storefront",
+      audience: "storefront-web",
+    });
+    if (
+      typeof payload.sub !== "string" ||
+      typeof payload.email !== "string" ||
+      typeof payload.name !== "string"
+    ) {
+      return null;
+    }
+    return {
+      subject: payload.sub,
+      email: payload.email,
+      displayName: payload.name,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function destroySession() {
+  (await cookies()).delete(COOKIE_NAME);
+}
+```
+
+Payload potpisanog JWT-a nije šifriran; u cookie stavi samo minimalne, neosjetljive claimove. Ne stavljaj password, provider access/refresh tokene ili payment podatke u JWT.
+
+**Primjer WordPress endpointa — putanja u WordPress repozitoriju: `wp-content/mu-plugins/headless-auth.php`**
+
+Ovaj mali endpoint je konkretna credential-based opcija, ne WordPress core login API. Stavi ga samo na WordPress instancu kojoj vjeruješ, koristi HTTPS i rate limitiraj `/wp-json/headless/v1/login` na reverse proxyju/WAF: primjer koda namjerno ne implementira distribuirani rate limiter.
+
+```php
+<?php
+/**
+ * Plugin Name: Headless Storefront Authentication
+ */
+
+add_action('rest_api_init', function () {
+    register_rest_route('headless/v1', '/login', [
+        'methods'             => 'POST',
+        'permission_callback' => '__return_true',
+        'callback'            => function (WP_REST_Request $request) {
+            $params = $request->get_json_params();
+            $email_param = is_array($params) ? ($params['email'] ?? null) : null;
+            $password_param = is_array($params) ? ($params['password'] ?? null) : null;
+
+            if (
+                !is_string($email_param) ||
+                !is_string($password_param)
+            ) {
+                return new WP_Error(
+                    'invalid_credentials',
+                    'Invalid email or password.',
+                    ['status' => 401]
+                );
+            }
+
+            $email = sanitize_email($email_param);
+            if (
+                !$email ||
+                !is_email($email) ||
+                $password_param === '' ||
+                strlen($password_param) > 1024
+            ) {
+                return new WP_Error(
+                    'invalid_credentials',
+                    'Invalid email or password.',
+                    ['status' => 401]
+                );
+            }
+
+            $user = wp_authenticate($email, $password_param);
+            if (is_wp_error($user)) {
+                return new WP_Error(
+                    'invalid_credentials',
+                    'Invalid email or password.',
+                    ['status' => 401]
+                );
+            }
+
+            $allowed_roles = apply_filters(
+                'headless_storefront_login_allowed_roles',
+                ['customer', 'subscriber']
+            );
+            if (!array_intersect($allowed_roles, (array) $user->roles)) {
+                return new WP_Error(
+                    'invalid_credentials',
+                    'Invalid email or password.',
+                    ['status' => 401]
+                );
+            }
+
+            return new WP_REST_Response([
+                'id'           => (string) $user->ID,
+                'email'        => (string) $user->user_email,
+                'display_name' => (string) $user->display_name,
+            ], 200);
+        },
+    ]);
+});
+
+add_filter('rest_pre_serve_request', function ($served, $result, $request) {
+    if ($request->get_route() === '/headless/v1/login') {
+        header('Cache-Control: private, no-store');
+        header('Pragma: no-cache');
+    }
+    return $served;
+}, 10, 3);
+```
+
+Ovaj endpoint ne stvara WordPress browser cookie niti WooCommerce customer cart sesiju; samo provjerava lozinku i vraća identitet za Next.js session. Zadani allowlist prihvaća role `customer` i `subscriber`; promijeni ga kroz filter samo nakon odluke koji računi smiju u storefront. Ako WordPress konfiguracija ne dopušta prijavu emailom kroz `wp_authenticate`, prilagodi login funkciju i testiraj je na stvarnoj WP verziji. Nemoj slati password kroz URL ili log.
+
+**Datoteka: `apps/storefront/src/auth/wordpress.ts`**
+
+```ts
+import type { AppIdentity } from "./session";
+
+const endpoint = process.env.WP_HEADLESS_AUTH_URL;
+if (!endpoint || new URL(endpoint).protocol !== "https:") {
+  throw new Error("WP_HEADLESS_AUTH_URL must be configured with HTTPS");
+}
+
+export async function authenticateWithWordPress(
+  email: string,
+  password: string
+): Promise<AppIdentity | null> {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ email, password }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(8_000),
+  });
+
+  if (response.status === 401) return null;
+  if (!response.ok) throw new Error("WordPress authentication unavailable");
+
+  const body: unknown = await response.json();
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    typeof (body as Record<string, unknown>).id !== "string" ||
+    typeof (body as Record<string, unknown>).email !== "string" ||
+    typeof (body as Record<string, unknown>).display_name !== "string"
+  ) {
+    throw new Error("WordPress returned an invalid identity response");
+  }
+
+  const identity = body as {
+    id: string;
+    email: string;
+    display_name: string;
+  };
+  return {
+    subject: identity.id,
+    email: identity.email,
+    displayName: identity.display_name,
+  };
+}
+```
+
+**Datoteka: `apps/storefront/app/api/auth/login/route.ts`**
+
+```ts
+import { authenticateWithWordPress } from "@/auth/wordpress";
+import { createSession } from "@/auth/session";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+  const email = body?.email;
+  const password = body?.password;
+
+  if (
+    typeof email !== "string" ||
+    email.length > 254 ||
+    typeof password !== "string" ||
+    password.length === 0 ||
+    password.length > 1024
+  ) {
+    return noStoreJson({ error: "invalid_credentials" }, 400);
+  }
+
+  try {
+    const identity = await authenticateWithWordPress(email.trim(), password);
+    if (!identity) return noStoreJson({ error: "invalid_credentials" }, 401);
+    await createSession(identity);
+    return noStoreJson({
+      user: {
+        email: identity.email,
+        displayName: identity.displayName,
+      },
+    });
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+Rate limiting mora se izvršavati prije slanja login pokušaja WordPressu (gateway/WAF ili shared store middleware) i na samom javno dostupnom WordPress login endpointu. Ne ograničavaj pokušaje samo u memoriji Next.js procesa jer više instanci ne dijeli stanje.
+
+**Datoteka: `apps/storefront/app/api/auth/me/route.ts`**
+
+```ts
+import { getSession } from "@/auth/session";
+import { noStoreJson } from "@/http/api";
+
+export async function GET() {
+  const user = await getSession();
+  if (!user) return noStoreJson({ user: null }, 401);
+  return noStoreJson({
+    user: { email: user.email, displayName: user.displayName },
+  });
+}
+```
+
+**Datoteka: `apps/storefront/app/api/auth/logout/route.ts`**
+
+```ts
+import { destroySession } from "@/auth/session";
+import { noStoreJson, requireSameOrigin } from "@/http/api";
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  await destroySession();
+  return noStoreJson({ success: true });
+}
+```
+
+Ako odabereš OIDC, nemoj prilagođavati `authenticateWithWordPress` da prima korisničku lozinku. Umjesto toga dodaj `GET /api/auth/login` start rutu i `GET /api/auth/callback` s provider SDK-om; obavezno validiraj `state`, `nonce`, PKCE, issuer, audience, redirect URI i token signature. Točan kod ovisi o odabranom provideru/SDK-u i mora se izraditi prema njegovoj dokumentaciji.
+
+### 14.10. Checkout GET i BACS primjer
+
+Primjer omogućuje checkout samo preko `bacs` ako ga WooCommerce vraća kao aktivnu metodu. To je namjerno zatvoren primjer; za Stripe/PayPal/ostale metode implementiraj gateway-specifično generiranje i validaciju `payment_data` te frontend SDK tokenizaciju.
+
+**Datoteka: `apps/storefront/app/api/checkout/route.ts`**
+
+```ts
+import { commerce } from "@/server/commerce";
+import { readCartToken, writeCartToken } from "@/server/cart-cookie";
+import {
+  downstreamError,
+  noStoreJson,
+  readJsonObject,
+  requireSameOrigin,
+} from "@/http/api";
+import type { Address, CheckoutInput } from "@repo/commerce";
+
+function parseAddress(value: unknown): Address | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const address = value as Record<string, unknown>;
+  const firstName = address.first_name;
+  const lastName = address.last_name;
+  const address1 = address.address_1;
+  const city = address.city;
+  const postcode = address.postcode;
+  const country = address.country;
+
+  if (
+    typeof firstName !== "string" ||
+    typeof lastName !== "string" ||
+    typeof address1 !== "string" ||
+    typeof city !== "string" ||
+    typeof postcode !== "string" ||
+    typeof country !== "string" ||
+    firstName.length > 100 ||
+    lastName.length > 100 ||
+    address1.length > 200 ||
+    city.length > 100 ||
+    postcode.length > 32 ||
+    !/^[A-Z]{2}$/.test(country)
+  ) {
+    return null;
+  }
+
+  const optionalString = (key: string, maxLength: number) => {
+    const item = address[key];
+    if (item === undefined) return undefined;
+    return typeof item === "string" && item.length <= maxLength ? item : null;
+  };
+  const address2 = optionalString("address_2", 200);
+  const state = optionalString("state", 100);
+  const email = optionalString("email", 254);
+  const phone = optionalString("phone", 64);
+  if ([address2, state, email, phone].includes(null)) return null;
+
+  return {
+    first_name: firstName,
+    last_name: lastName,
+    address_1: address1,
+    city,
+    postcode,
+    country,
+    ...(typeof address2 === "string" ? { address_2: address2 } : {}),
+    ...(typeof state === "string" ? { state } : {}),
+    ...(typeof email === "string" ? { email } : {}),
+    ...(typeof phone === "string" ? { phone } : {}),
+  };
+}
+
+export async function GET() {
+  try {
+    const cart = await commerce.getCart(await readCartToken());
+    await writeCartToken(cart.cartToken);
+    const result = await commerce.getCheckout(cart.cartToken);
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+
+export async function POST(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+  const billingAddress = parseAddress(body?.billing_address);
+  const shippingAddress = parseAddress(body?.shipping_address);
+  const paymentMethod = body?.payment_method;
+  const expectedTotal = body?.expected_total;
+  const customerNote = body?.customer_note;
+
+  if (
+    !billingAddress ||
+    !shippingAddress ||
+    typeof billingAddress.email !== "string" ||
+    !billingAddress.email.includes("@") ||
+    paymentMethod !== "bacs" ||
+    (expectedTotal !== undefined &&
+      (typeof expectedTotal !== "string" || !/^\d+$/.test(expectedTotal))) ||
+    (customerNote !== undefined &&
+      (typeof customerNote !== "string" || customerNote.length > 1000))
+  ) {
+    return noStoreJson({ error: "invalid_checkout" }, 400);
+  }
+
+  try {
+    const token = await readCartToken();
+    const cart = await commerce.getCart(token);
+    await writeCartToken(cart.cartToken);
+    if (!cart.data.payment_methods?.includes("bacs")) {
+      return noStoreJson({ error: "payment_method_unavailable" }, 400);
+    }
+
+    const input: CheckoutInput = {
+      billing_address: billingAddress,
+      shipping_address: shippingAddress,
+      payment_method: "bacs",
+      ...(typeof customerNote === "string"
+        ? { customer_note: customerNote }
+        : {}),
+      ...(typeof expectedTotal === "string"
+        ? { expected_total: expectedTotal }
+        : {}),
+    };
+    const result = await commerce.submitCheckout(input, cart.cartToken ?? token);
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+
+export async function PUT(request: Request) {
+  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  const body = await readJsonObject(request);
+  const paymentMethod = body?.payment_method;
+  const orderNotes = body?.order_notes;
+
+  if (
+    (paymentMethod !== undefined && paymentMethod !== "bacs") ||
+    (orderNotes !== undefined &&
+      (typeof orderNotes !== "string" || orderNotes.length > 1000))
+  ) {
+    return noStoreJson({ error: "invalid_checkout_update" }, 400);
+  }
+
+  try {
+    const token = await readCartToken();
+    const cart = await commerce.getCart(token);
+    await writeCartToken(cart.cartToken);
+    if (
+      paymentMethod === "bacs" &&
+      !cart.data.payment_methods?.includes("bacs")
+    ) {
+      return noStoreJson({ error: "payment_method_unavailable" }, 400);
+    }
+
+    const result = await commerce.updateCheckout(
+      {
+        ...(paymentMethod ? { payment_method: paymentMethod } : {}),
+        ...(typeof orderNotes === "string" ? { order_notes: orderNotes } : {}),
+      },
+      cart.cartToken ?? token
+    );
+    await writeCartToken(result.cartToken);
+    return noStoreJson(result.data);
+  } catch (error) {
+    return downstreamError(error);
+  }
+}
+```
+
+Store API `POST /checkout` zahtijeva billing/shipping adresu i payment method. `PUT /checkout` sprema odabranu metodu/napomenu prema podržanom Store API ugovoru. Poslije potvrde checkouta tretiraj WooCommerce/gateway rezultat kao odgovor procesa; ne proglasi uplatu uspješnom samo zbog UI redirecta. Za gateway koji redirecta, validiraj order status server-side ili primitak potpisanog webhooka.
+
+**Datoteka: `packages/ui/src/components/checkout/CheckoutForm.tsx`**
+
+```tsx
+"use client";
+
+import { useState } from "react";
+
+export function CheckoutForm() {
+  const [message, setMessage] = useState("");
+  const [pending, setPending] = useState(false);
+
+  async function submit(formData: FormData) {
+    if (pending) return;
+    setPending(true);
+    setMessage("");
+
+    try {
+      const address = {
+        first_name: String(formData.get("first_name") ?? ""),
+        last_name: String(formData.get("last_name") ?? ""),
+        address_1: String(formData.get("address_1") ?? ""),
+        city: String(formData.get("city") ?? ""),
+        postcode: String(formData.get("postcode") ?? ""),
+        country: String(formData.get("country") ?? "").toUpperCase(),
+        email: String(formData.get("email") ?? ""),
+      };
+
+      const response = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          billing_address: address,
+          shipping_address: address,
+          payment_method: "bacs",
+        }),
+      });
+
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        setMessage("Narudžbu nije moguće poslati. Provjerite podatke i pokušajte ponovno.");
+        return;
+      }
+      const orderId =
+        typeof result === "object" && result !== null
+          ? (result as Record<string, unknown>).order_id
+          : undefined;
+      setMessage(`Narudžba ${String(orderId ?? "")} je zaprimljena.`);
+    } catch {
+      setMessage("Veza s trgovinom trenutno nije dostupna.");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <form action={submit}>
+      <label>
+        Ime <input name="first_name" required />
+      </label>
+      <label>
+        Prezime <input name="last_name" required />
+      </label>
+      <label>
+        Adresa <input name="address_1" required />
+      </label>
+      <label>
+        Grad <input name="city" required />
+      </label>
+      <label>
+        Poštanski broj <input name="postcode" required />
+      </label>
+      <label>
+        Država (ISO-3166-1 alpha-2) <input name="country" minLength={2} maxLength={2} required />
+      </label>
+      <label>
+        Email <input name="email" type="email" required />
+      </label>
+      <button type="submit" disabled={pending}>
+        {pending ? "Slanje…" : "Naruči uz bankovni transfer"}
+      </button>
+      {message && <p role="status">{message}</p>}
+    </form>
+  );
+}
+```
+
+Ovaj jednostavni UI koristi isti billing i shipping address radi preglednosti; produkcijski checkout treba odvojeno omogućiti različitu adresu dostave, validirati sva polja prema WooCommerce country/state pravilima i prije slanja prikazati aktualne shipping/tax/totals podatke iz Store API-ja. UI validacija je samo UX; BFF/WooCommerce validacija ostaje autoritativna.
+
+### 14.11. Test jednog važnog ugovora commerce klijenta
+
+Ako workspace već koristi Vitest, dodaj test u postojeći test target; ako ne, koristi postojeći runner umjesto da uvodiš drugi.
+
+**Datoteka: `packages/commerce/src/store-api/client.test.ts`**
+
+```ts
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { storeApiRequest } from "./client";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("storeApiRequest", () => {
+  it("prosljeđuje Cart-Token i vraća obnovljeni token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ items: [], items_count: 0 }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Cart-Token": "rotated-token",
+        },
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await storeApiRequest<{ items: unknown[] }>({
+      baseUrl: "https://cms.example.com/wp-json/wc/store/v1",
+      path: "cart",
+      cartToken: "old-token",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(new Headers(init.headers).get("Cart-Token")).toBe("old-token");
+    expect(result.cartToken).toBe("rotated-token");
+    expect(result.data.items).toEqual([]);
+  });
+});
+```
+
+### 14.12. Reverse proxy primjer
+
+Ovaj Nginx primjer terminira TLS uz postojeće certifikate i šalje samo storefront traffic u Next.js; CMS host je server-side upstream u aplikacijskoj konfiguraciji, ne browser proxy route.
+
+**Datoteka: `infra/proxy/nginx.conf`**
+
+```nginx
+# Uključi ovaj snippet unutar Nginx http {} konteksta.
+limit_req_zone $binary_remote_addr zone=store_login:10m rate=5r/m;
+
+server {
+    listen 443 ssl http2;
+    server_name shop.example.com;
+
+    ssl_certificate     /etc/ssl/certs/shop.crt;
+    ssl_certificate_key /etc/ssl/private/shop.key;
+
+    location = /api/auth/login {
+        limit_req zone=store_login burst=3 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://storefront:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location / {
+        proxy_pass http://storefront:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+    }
+}
+```
+
+U deploymentu povjeri `X-Forwarded-*` vrijednosti samo proxyju koji kontroliraš, nemoj vjerovati proizvoljnim client-supplied forwarding headerima i provjeri da aplikacija/CDN ne cacheira `/api/cart`, `/api/checkout` ili `/api/auth`.
+Ako je Nginx iza load balancera, konfiguriraj `real_ip` samo za poznate proxy IP/CIDR raspone kako rate limit ne bi koristio istu adresu za sve kupce niti vjerovao lažnom `X-Forwarded-For`.
+
+### 14.13. Što ovisi o konkretnom provideru
+
+Sljedeće granice ne mogu biti univerzalno implementirane bez izbora dodatne tehnologije:
+
+1. **OIDC callback** — SDK, discovery URL, client authentication, PKCE i provider-specific claim mapping.
+2. **Customer cart** — način na koji WooCommerce dobiva provjeren WordPress customer identitet; Next.js app session i Cart-Token to ne uspostavljaju sami.
+3. **Kartično plaćanje** — browser SDK/tokenizacija i `payment_data` polja konkretnog gatewaya.
+4. **Webhook** — signature header/algoritam, replay protection i event model ovise o payment provideru.
+5. **Session revoke i shared rate limit** — zahtijevaju odabrani Redis/DB/WAF ili auth/session servis.
+
+Za svaku od tih stavki napravi zaseban ADR u `docs/architecture/` i provider-specific contract/integration test. Nemoj zamijeniti nedostajući provider ugovor generičkim success responseom.
