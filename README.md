@@ -19,15 +19,15 @@ apps/storefront (Next.js App Router, BFF)
 
 ### Uloge i povjerenje
 
-| Dio | Odgovornost |
-|---|---|
-| `apps/storefront` | BFF route handlers, čitanje/pisanje browser cookieja, auth session, request validacija, CSRF/Origin provjere i response policy |
-| `packages/commerce` | Framework-agnostični Store API client, transportni modeli, parsiranje/normalizacija WooCommerce odgovora i commerce operacije |
-| `packages/ui` | Prikaz proizvoda, košarice i checkouta te UX stanja; nema WooCommerce tajni ni pristupa session-token vrijednostima |
-| `packages/configuration` | Zajednički TypeScript, ESLint i Prettier postavke; ne sprema aplikacijske tajne |
-| `infra/` | Reverse proxy, deployment, TLS, tajne u runtimeu, health checks i CI |
-| `docs/architecture/` | ADR-ovi za auth provider, cart merge i payment flow |
-| `docs/runbooks/` | Deploy, rollback, incidenti, provider/webhook operacije |
+| Dio                      | Odgovornost                                                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `apps/storefront`        | BFF route handlers, čitanje/pisanje browser cookieja, auth session, request validacija, CSRF/Origin provjere i response policy |
+| `packages/commerce`      | Framework-agnostični Store API client, transportni modeli, parsiranje/normalizacija WooCommerce odgovora i commerce operacije  |
+| `packages/ui`            | Prikaz proizvoda, košarice i checkouta te UX stanja; nema WooCommerce tajni ni pristupa session-token vrijednostima            |
+| `packages/configuration` | Zajednički TypeScript, ESLint i Prettier postavke; ne sprema aplikacijske tajne                                                |
+| `infra/`                 | Reverse proxy, deployment, TLS, tajne u runtimeu, health checks i CI                                                           |
+| `docs/architecture/`     | ADR-ovi za auth provider, cart merge i payment flow                                                                            |
+| `docs/runbooks/`         | Deploy, rollback, incidenti, provider/webhook operacije                                                                        |
 
 Važno je izbjeći ovo arhitekturno miješanje: `packages/commerce` **ne smije** uvoziti `next/headers`, `NextRequest` ili Next.js cookie helpers. Next.js sloj čita cookie, prosljeđuje token adapteru kao argument i upisuje eventualno obnovljeni token u response cookie.
 
@@ -91,8 +91,10 @@ APP_ORIGIN=https://shop.example.com
 AUTH_PROVIDER_ISSUER=https://identity.example.com
 # Provider client secret samo ako odabrani flow to zahtijeva:
 AUTH_PROVIDER_CLIENT_SECRET=...
-# Session storage konekcija/ključ po potrebi:
-SESSION_STORE_URL=...
+# JWT signing secret (random, at least 32 bytes):
+AUTH_SECRET=... # Optional; when absent it is derived from HEADLESS_AUTH_SECRET
+HEADLESS_AUTH_SECRET=... # Same secret as wp-config.php HEADLESS_AUTH_SECRET
+HEADLESS_AUTH_URL=https://cms.example.com/wp-json/headless/v1/auth
 ```
 
 - `WC_STORE_API_URL` mora biti konfigurirana server-side konstanta; nikad ne uzimaj host ili puni URL iz browser requesta.
@@ -117,18 +119,18 @@ https://cms.example.com/wp-json/wc/store/v1
 
 Osnovne Store API operacije:
 
-| Namjena | Metoda i Store API putanja |
-|---|---|
-| Dohvati cart | `GET /cart` |
-| Dodaj stavku | `POST /cart/add-item` |
-| Promijeni količinu | `POST /cart/update-item` |
-| Ukloni stavku | `POST /cart/remove-item` |
-| Primijeni/ukloni kupon | `POST /cart/apply-coupon`, `POST /cart/remove-coupon` |
-| Ažuriraj customer/shipping podatke | `POST /cart/update-customer` |
-| Odaberi shipping rate | `POST /cart/select-shipping-rate` |
-| Checkout podaci | `GET /checkout` |
-| Ažuriraj checkout polja | `PUT /checkout` |
-| Kreiraj narudžbu i obradi payment | `POST /checkout` |
+| Namjena                            | Metoda i Store API putanja                            |
+| ---------------------------------- | ----------------------------------------------------- |
+| Dohvati cart                       | `GET /cart`                                           |
+| Dodaj stavku                       | `POST /cart/add-item`                                 |
+| Promijeni količinu                 | `POST /cart/update-item`                              |
+| Ukloni stavku                      | `POST /cart/remove-item`                              |
+| Primijeni/ukloni kupon             | `POST /cart/apply-coupon`, `POST /cart/remove-coupon` |
+| Ažuriraj customer/shipping podatke | `POST /cart/update-customer`                          |
+| Odaberi shipping rate              | `POST /cart/select-shipping-rate`                     |
+| Checkout podaci                    | `GET /checkout`                                       |
+| Ažuriraj checkout polja            | `PUT /checkout`                                       |
+| Kreiraj narudžbu i obradi payment  | `POST /checkout`                                      |
 
 Za POST cart operacije i sve checkout zahtjeve potreban je Store API `Nonce` ili `Cart-Token`. U ovoj BFF arhitekturi odabire se Cart-Token, pa Store API nonce ne treba slati uz te zahtjeve. Nemoj miješati ovaj nonce s WordPress REST API `X-WP-Nonce`.
 
@@ -163,12 +165,12 @@ export type StoreApiResult<T> = {
 };
 
 export async function getCart(
-  cartToken?: string
+  cartToken?: string,
 ): Promise<StoreApiResult<Cart>>;
 
 export async function addCartItem(
   input: AddCartItemInput,
-  cartToken?: string
+  cartToken?: string,
 ): Promise<StoreApiResult<Cart>>;
 ```
 
@@ -244,10 +246,10 @@ UI treba prikazati loading/error/empty states, spriječiti duple submitove i nak
 
 Odvojeni su identitet korisnika i WooCommerce cart:
 
-| Cookie/session | Značenje |
-|---|---|
-| `app_session` | Next.js aplikacijska sesija; veže zahtjev s autentificiranim identitetom kroz server-side session sloj |
-| `cart_token` | WooCommerce Store API cart sesija; ne identificira WordPress korisnika |
+| Cookie/session | Značenje                                                                                               |
+| -------------- | ------------------------------------------------------------------------------------------------------ |
+| `app_session`  | Next.js aplikacijska sesija; veže zahtjev s autentificiranim identitetom kroz server-side session sloj |
+| `cart_token`   | WooCommerce Store API cart sesija; ne identificira WordPress korisnika                                 |
 
 Oba cookieja su `HttpOnly`, `Secure` u produkciji, `SameSite=Lax` ili strože gdje UX dopušta, `Path=/` i bez `Domain`, osim ako arhitektura izričito zahtijeva drugačije. Korisnički JavaScript ih ne čita.
 
@@ -275,15 +277,9 @@ WooCommerce REST API consumer key/secret su integracijski credentials, ne custom
 
 ### 5.2. Session lifecycle
 
-Preporučeni početni model je neproziran, kriptografski nasumičan session ID u `HttpOnly` cookieju, a session sadržaj i provider refresh tokeni u server-side storeu (npr. Redis ili baza). Vrijednost u cookieju ne sadrži podatke korisnika. Implementiraj:
+Početna implementacija koristi potpisani, stateless JWT u `HttpOnly` cookieju. U token se stavljaju samo minimalni identitetski claimovi; provider refresh tokeni se ne spremaju u browser cookie. Token ima kratko trajanje, provjereni issuer/audience i allowlist algoritma. Zaseban `AUTH_SECRET` je opcionalan; ako nije postavljen, signing key se izvodi iz najmanje 32-bajtnog `HEADLESS_AUTH_SECRET` uz zaseban HKDF context.
 
-- rotaciju session ID-a nakon uspješnog login-a i promjene privilegija;
-- idle i absolute expiry, server-side opoziv i brisanje sessiona pri logoutu;
-- redakciju session ID-ja iz logova i kontrolu session store pristupa;
-- re-authentication/step-up pravilo za osjetljive account akcije;
-- zaštitu login, registracije i password reset endpointa rate limitingom.
-
-Potpisani JWT može biti alternativa, ali sam potpisani stateless JWT ne omogućuje trenutno opozivanje bez denylist/session-version sloja. Ako se bira, definiraj kratko trajanje, issuer/audience/algorithm allowlist, rotaciju ključa i jasan logout/expiry ugovor. Nemoj koristiti neprovjereni `AUTH_SECRET!` fallback ili hardkodiran tajni ključ.
+Logout briše cookie, ali ne može opozvati kopiju već izdanog tokena. Ona ostaje valjana najviše 30 minuta. Trenutačni opoziv pojedinačne sesije tražio bi server-side denylist/session version ili revocable refresh-token pohranu, što nije dio ove stateless implementacije. Signing key rotacija opoziva sve tokene potpisane starim ključem, ne samo jednu sesiju. Rate limiting login-a mora biti na storefront i WordPress WAF/proxy sloju.
 
 ### 5.3. Auth BFF rute
 
@@ -295,10 +291,10 @@ POST /api/auth/logout
 GET  /api/auth/me
 ```
 
-- Login body validiraj, primijeni rate limiting i Origin/CSRF zaštitu; vrati generičku grešku za netočne vjerodajnice.
+- Login body validiraj, primijeni Origin/CSRF zaštitu i ograniči pokušaje na WAF/proxy sloju; vrati generičku grešku za netočne vjerodajnice.
 - Tek nakon potvrde providera izdaj novu app session i postavi cookie.
 - `/me` dohvaća trenutni identitet iz provjerene sesije; gdje treba, osvježi profil iz autoritativnog providera.
-- Logout opozove server-side sesiju i obriše `app_session`. Odvojeno definiraj zadržava li se guest cart; uobičajeno je logoutom ne brisati cart bez izričite korisničke namjere.
+- Logout obriše `app_session`; JWT koji je kopiran prije logouta vrijedi do isteka. Guest cart se zadržava.
 - Reset lozinke, registracija i account recovery ovise o provideru; ne simuliraj ih lokalno ako je identity provider njihov izvor istine.
 
 ## 6. Cart nakon login-a i merge politika
@@ -407,7 +403,7 @@ Prije produkcije potvrdi:
 - [ ] Cart radi za gosta nakon refreshanja i token ostaje HttpOnly.
 - [ ] Cart/checkout/auth odgovori imaju `no-store`; proxy/CDN ih ne cacheira.
 - [ ] Cart-Token se prosljeđuje samo server-side i response token se rotira/ažurira.
-- [ ] Auth provider je odabran; login, expiry, logout i server-side revoke su testirani.
+- [ ] Auth provider je odabran; login, JWT expiry, cookie logout i signing-key rotation su testirani.
 - [ ] Dokumentirano je da app auth i WooCommerce customer session nisu automatski ista sesija.
 - [ ] Cart merge pravila su implementirana i testirana ili je jasno navedeno da merge nije podržan.
 - [ ] Login/reset/checkout imaju rate-limit i Origin/CSRF zaštitu.
@@ -418,16 +414,16 @@ Prije produkcije potvrdi:
 
 ## 12. Ispravci u odnosu na početni nacrt
 
-| Početna tvrdnja/primjer | Preciznija uputa |
-|---|---|
-| Jedan generički `app_session` JWT je dovoljan za produkcijsku auth sesiju. | Provider potvrđuje identitet; preporučena je opaque server-side sesija s rotacijom i opozivom. Stateless JWT ima eksplicitne trade-offe i nije sam po sebi opoziv. |
-| Cart-Token i WordPress user auth mogu se držati odvojeno, ali prijava je dovoljna za account cart. | Cart-Token identificira cart sesiju, ne WordPress korisnika. Za customer cart treba podržana WordPress/WooCommerce identity integracija. |
-| Svi checkout pozivi su GET/POST. | Checkout podržava `GET`, `PUT` i `POST`; `POST` obrađuje narudžbu/plaćanje. `PUT` ugovor i eksperimentalna polja moraju se koristiti prema aktualnoj dokumentaciji. |
-| Proxy samo prosljeđuje checkout JSON. | Server mora validirati adrese, odabranu payment metodu, gateway-specific payment data, total mismatch i greške/retry. |
-| Token cookie se ažurira samo u get/add primjerima. | Sačuvaj novi `Cart-Token` iz svakog relevantnog cart/checkout odgovora, bez slanja tokena browseru. |
-| `try/catch` bez logiranja vraća isti 500 za sve greške. | Klasificiraj validacijske/downstream/timeout greške, logiraj sanitiziran tehnički uzrok s correlation ID-jem i vrati siguran status. |
-| Istoj javnoj domeni treba proxyirati `/wp-json/*`. | To je opcionalna topologija; BFF može zvati CMS server-side. Ograniči izložene CMS putanje i zadrži browser na `/api/*`. |
-| `Number(total_price) / 10**minorUnit` je dobar način financijskog računanja. | Sačuvaj minor-unit preciznost; `Number` koristi samo uz dokazanu sigurnu granicu ili decimalni/integer pristup. |
+| Početna tvrdnja/primjer                                                                            | Preciznija uputa                                                                                                                                                    |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Jedan generički `app_session` JWT je dovoljan za produkcijsku auth sesiju.                         | Provider potvrđuje identitet; preporučena je opaque server-side sesija s rotacijom i opozivom. Stateless JWT ima eksplicitne trade-offe i nije sam po sebi opoziv.  |
+| Cart-Token i WordPress user auth mogu se držati odvojeno, ali prijava je dovoljna za account cart. | Cart-Token identificira cart sesiju, ne WordPress korisnika. Za customer cart treba podržana WordPress/WooCommerce identity integracija.                            |
+| Svi checkout pozivi su GET/POST.                                                                   | Checkout podržava `GET`, `PUT` i `POST`; `POST` obrađuje narudžbu/plaćanje. `PUT` ugovor i eksperimentalna polja moraju se koristiti prema aktualnoj dokumentaciji. |
+| Proxy samo prosljeđuje checkout JSON.                                                              | Server mora validirati adrese, odabranu payment metodu, gateway-specific payment data, total mismatch i greške/retry.                                               |
+| Token cookie se ažurira samo u get/add primjerima.                                                 | Sačuvaj novi `Cart-Token` iz svakog relevantnog cart/checkout odgovora, bez slanja tokena browseru.                                                                 |
+| `try/catch` bez logiranja vraća isti 500 za sve greške.                                            | Klasificiraj validacijske/downstream/timeout greške, logiraj sanitiziran tehnički uzrok s correlation ID-jem i vrati siguran status.                                |
+| Istoj javnoj domeni treba proxyirati `/wp-json/*`.                                                 | To je opcionalna topologija; BFF može zvati CMS server-side. Ograniči izložene CMS putanje i zadrži browser na `/api/*`.                                            |
+| `Number(total_price) / 10**minorUnit` je dobar način financijskog računanja.                       | Sačuvaj minor-unit preciznost; `Number` koristi samo uz dokazanu sigurnu granicu ili decimalni/integer pristup.                                                     |
 
 ## 13. Službena dokumentacija
 
@@ -469,7 +465,8 @@ if (
 }
 if (
   !["https:", "http:"].includes(parsedAppOrigin.protocol) ||
-  (process.env.NODE_ENV === "production" && parsedAppOrigin.protocol !== "https:")
+  (process.env.NODE_ENV === "production" &&
+    parsedAppOrigin.protocol !== "https:")
 ) {
   throw new Error("APP_ORIGIN must use HTTPS in production");
 }
@@ -485,11 +482,12 @@ export const config = {
 ```env
 WC_STORE_API_URL=https://cms.example.com/wp-json/wc/store/v1
 APP_ORIGIN=http://localhost:3000
-AUTH_SECRET=replace-with-at-least-32-random-bytes
-WP_HEADLESS_AUTH_URL=https://cms.example.com/wp-json/headless/v1/login
+AUTH_SECRET=optional-separate-app-jwt-secret-at-least-32-bytes
+HEADLESS_AUTH_SECRET=the-same-secret-as-wp-config.php
+HEADLESS_AUTH_URL=https://cms.example.com/wp-json/headless/v1/auth
 ```
 
-`AUTH_SECRET` se koristi u primjeru JWT sessiona ispod. Generiraj vrijednost lokalno pomoću `openssl rand -base64 32`; produkcijsku vrijednost dostavi kroz secret manager, nikad je ne commitaj.
+Ako postavljaš `AUTH_SECRET`, generiraj ga pomoću `openssl rand -base64 32` i dostavi kroz secret manager; inače se app key izvodi iz `HEADLESS_AUTH_SECRET`.
 
 **Datoteka: `apps/storefront/tsconfig.json` — relevantan dio**
 
@@ -630,7 +628,7 @@ export class StoreApiError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly responseBody?: unknown,
-    readonly cartToken?: string
+    readonly cartToken?: string,
   ) {
     super(message);
     this.name = "StoreApiError";
@@ -683,7 +681,7 @@ export async function storeApiRequest<T>({
       502,
       undefined,
       undefined,
-      responseCartToken
+      responseCartToken,
     );
   }
 
@@ -703,7 +701,7 @@ export async function storeApiRequest<T>({
       response.status,
       errorBody?.code,
       data,
-      responseCartToken
+      responseCartToken,
     );
   }
 
@@ -730,7 +728,7 @@ export function getCart(baseUrl: string, cartToken?: string) {
 export function addCartItem(
   baseUrl: string,
   input: AddCartItemInput,
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Cart>({
     baseUrl,
@@ -744,7 +742,7 @@ export function addCartItem(
 export function updateCartItem(
   baseUrl: string,
   input: { key: string; quantity: number },
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Cart>({
     baseUrl,
@@ -758,7 +756,7 @@ export function updateCartItem(
 export function removeCartItem(
   baseUrl: string,
   key: string,
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Cart>({
     baseUrl,
@@ -772,7 +770,7 @@ export function removeCartItem(
 export function updateCustomer(
   baseUrl: string,
   input: { billing_address?: unknown; shipping_address?: unknown },
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Cart>({
     baseUrl,
@@ -786,7 +784,7 @@ export function updateCustomer(
 export function selectShippingRate(
   baseUrl: string,
   input: { packageId: number; rateId: string },
-  cartToken?: string
+  cartToken?: string,
 ) {
   const query = new URLSearchParams({
     package_id: String(input.packageId),
@@ -819,7 +817,7 @@ export function getCheckout(baseUrl: string, cartToken?: string) {
 export function submitCheckout(
   baseUrl: string,
   input: CheckoutInput,
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Checkout>({
     baseUrl,
@@ -837,7 +835,7 @@ export function updateCheckout(
     order_notes?: string;
     additional_fields?: Record<string, unknown>;
   },
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Checkout>({
     baseUrl,
@@ -915,7 +913,7 @@ export function noStoreJson(data: unknown, status = 200) {
 }
 
 export async function readJsonObject(
-  request: Request
+  request: Request,
 ): Promise<Record<string, unknown> | null> {
   const contentLength = Number(request.headers.get("content-length") ?? 0);
   if (contentLength > 32_000) return null;
@@ -961,18 +959,13 @@ export async function downstreamError(error: unknown) {
           error: "conflict",
           ...(typeof cart === "object" && cart !== null ? { cart } : {}),
         },
-        409
+        409,
       );
     }
 
     const status =
-      error.status >= 400 && error.status < 500
-          ? error.status
-          : 502;
-    return noStoreJson(
-      { error: "commerce_error" },
-      status
-    );
+      error.status >= 400 && error.status < 500 ? error.status : 502;
+    return noStoreJson({ error: "commerce_error" }, status);
   }
 
   const requestId = crypto.randomUUID();
@@ -1008,26 +1001,26 @@ export const commerce = {
     addCartItem(config.storeApiUrl, input, token),
   updateCartItem: (
     input: Parameters<typeof updateCartItem>[1],
-    token?: string
+    token?: string,
   ) => updateCartItem(config.storeApiUrl, input, token),
   removeCartItem: (key: string, token?: string) =>
     removeCartItem(config.storeApiUrl, key, token),
   updateCustomer: (
     input: Parameters<typeof updateCustomer>[1],
-    token?: string
+    token?: string,
   ) => updateCustomer(config.storeApiUrl, input, token),
   selectShippingRate: (
     input: Parameters<typeof selectShippingRate>[1],
-    token?: string
+    token?: string,
   ) => selectShippingRate(config.storeApiUrl, input, token),
   getCheckout: (token?: string) => getCheckout(config.storeApiUrl, token),
   submitCheckout: (
     input: Parameters<typeof submitCheckout>[1],
-    token?: string
+    token?: string,
   ) => submitCheckout(config.storeApiUrl, input, token),
   updateCheckout: (
     input: Parameters<typeof updateCheckout>[1],
-    token?: string
+    token?: string,
   ) => updateCheckout(config.storeApiUrl, input, token),
 };
 ```
@@ -1099,14 +1092,15 @@ function isVariation(value: unknown): value is CartVariation[] {
         typeof item.attribute === "string" &&
         item.attribute.length <= 128 &&
         typeof item.value === "string" &&
-        item.value.length <= 200
+        item.value.length <= 200,
     ) &&
     value.length <= 20
   );
 }
 
 export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
 
   const body = await readJsonObject(request);
   const id = body?.id;
@@ -1132,7 +1126,7 @@ export async function POST(request: Request) {
         quantity,
         ...(variation ? { variation } : {}),
       },
-      await ensureCartToken()
+      await ensureCartToken(),
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -1162,7 +1156,8 @@ import {
 type RouteContext = { params: Promise<{ key: string }> };
 
 export async function PATCH(request: Request, context: RouteContext) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
 
   const body = await readJsonObject(request);
   const quantity = body?.quantity;
@@ -1181,7 +1176,7 @@ export async function PATCH(request: Request, context: RouteContext) {
   try {
     const result = await commerce.updateCartItem(
       { key, quantity },
-      await ensureCartToken()
+      await ensureCartToken(),
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -1191,7 +1186,8 @@ export async function PATCH(request: Request, context: RouteContext) {
 }
 
 export async function DELETE(request: Request, context: RouteContext) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
 
   const { key } = await context.params;
   if (!key || key.length > 128) {
@@ -1238,7 +1234,8 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
   const body = await readJsonObject(request);
   const rawAddress = body?.shipping_address;
 
@@ -1277,7 +1274,7 @@ export async function POST(request: Request) {
   try {
     const result = await commerce.updateCustomer(
       { shipping_address: shippingAddress },
-      await ensureCartToken()
+      await ensureCartToken(),
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -1301,7 +1298,8 @@ import {
 } from "@/http/api";
 
 export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
   const body = await readJsonObject(request);
 
   if (
@@ -1318,7 +1316,7 @@ export async function POST(request: Request) {
   try {
     const result = await commerce.selectShippingRate(
       { packageId: body.packageId, rateId: body.rateId },
-      await ensureCartToken()
+      await ensureCartToken(),
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -1338,11 +1336,7 @@ WooCommerce prihvaća `package_id` i `rate_id` za `/cart/select-shipping-rate`. 
 import { storeApiRequest } from "./client";
 import type { Cart } from "./types";
 
-export function applyCoupon(
-  baseUrl: string,
-  code: string,
-  cartToken?: string
-) {
+export function applyCoupon(baseUrl: string, code: string, cartToken?: string) {
   return storeApiRequest<Cart>({
     baseUrl,
     path: "cart/apply-coupon",
@@ -1355,7 +1349,7 @@ export function applyCoupon(
 export function removeCoupon(
   baseUrl: string,
   code: string,
-  cartToken?: string
+  cartToken?: string,
 ) {
   return storeApiRequest<Cart>({
     baseUrl,
@@ -1384,10 +1378,15 @@ import {
 } from "@/http/api";
 
 async function mutateCoupon(request: Request, remove: boolean) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
   const body = await readJsonObject(request);
   const code = body?.code;
-  if (typeof code !== "string" || code.trim().length === 0 || code.length > 128) {
+  if (
+    typeof code !== "string" ||
+    code.trim().length === 0 ||
+    code.length > 128
+  ) {
     return noStoreJson({ error: "invalid_coupon" }, 400);
   }
 
@@ -1396,7 +1395,7 @@ async function mutateCoupon(request: Request, remove: boolean) {
     const result = await operation(
       config.storeApiUrl,
       code.trim(),
-      await ensureCartToken()
+      await ensureCartToken(),
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -1451,10 +1450,9 @@ export function Cart() {
 
   async function removeItem(key: string) {
     setError(null);
-    const response = await fetch(
-      `/api/cart/items/${encodeURIComponent(key)}`,
-      { method: "DELETE" }
-    );
+    const response = await fetch(`/api/cart/items/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+    });
     if (!response.ok) {
       const failure: unknown = await response.json();
       if (
@@ -1478,7 +1476,7 @@ export function Cart() {
   const formattedTotal = formatMinorUnits(
     cart.totals.total_price,
     cart.totals.currency_code,
-    cart.totals.currency_minor_unit
+    cart.totals.currency_minor_unit,
   );
 
   return (
@@ -1522,9 +1520,12 @@ function formatMinorUnits(value: string, currency: string, minorUnit: number) {
     minimumFractionDigits: minorUnit,
     maximumFractionDigits: minorUnit,
   });
-  const wholeForPattern = negative && whole === 0n ? -1n : negative ? -whole : whole;
+  const wholeForPattern =
+    negative && whole === 0n ? -1n : negative ? -whole : whole;
   const parts = formatter.formatToParts(wholeForPattern);
-  const digitFormatter = new Intl.NumberFormat(undefined, { useGrouping: false });
+  const digitFormatter = new Intl.NumberFormat(undefined, {
+    useGrouping: false,
+  });
   const localizedFraction = [...fraction]
     .map((digit) => digitFormatter.format(Number(digit)))
     .join("");
@@ -1543,7 +1544,7 @@ Formatter koristi `BigInt` za minor-unit vrijednosti i ne radi floating-point ar
 
 ### 14.9. Aplikacijska sesija i WordPress credential adapter
 
-Sljedeći session primjer koristi potpisani JWT radi samostalnog rada bez dodatnog session-store packagea. Zbog stateless dizajna logout ne opoziva već izdani token prije isteka; za trenutačni revoke koristi server-side session store i zamijeni ovaj primjer. `jose` dodaj kao dependency u `apps/storefront`.
+Implementacija koristi potpisani JWT bez vanjskog session-store servisa. Zbog stateless dizajna logout ne opoziva već izdani token prije isteka. `jose` je dependency u `apps/storefront`.
 
 **Datoteka: `apps/storefront/src/auth/session.ts`**
 
@@ -1552,7 +1553,7 @@ import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 
 const COOKIE_NAME = "app_session";
-const SESSION_SECONDS = 60 * 60 * 24 * 7;
+const SESSION_SECONDS = 60 * 30;
 const rawSecret = process.env.AUTH_SECRET;
 
 if (!rawSecret || new TextEncoder().encode(rawSecret).length < 32) {
@@ -1623,213 +1624,9 @@ export async function destroySession() {
 
 Payload potpisanog JWT-a nije šifriran; u cookie stavi samo minimalne, neosjetljive claimove. Ne stavljaj password, provider access/refresh tokene ili payment podatke u JWT.
 
-**Primjer WordPress endpointa — putanja u WordPress repozitoriju: `wp-content/mu-plugins/headless-auth.php`**
+Aktivna integracija je implementirana u `apps/storefront/src/auth/wordpress.ts`, `apps/storefront/src/auth/wordpress-session.ts` i `apps/storefront/app/api/auth/`. Storefront zove `/auth/login`, `/auth/me` i `/auth/logout` na `WP_HEADLESS_AUTH_URL`, šalje `X-Headless-Secret`, a session cookie value i nonce čuva isključivo u HttpOnly kolačićima. `/me` validira sesiju kod WordPressa; `/logout` traži server-side opoziv session tokena. App JWT traje 30 minuta; odvojena WordPress provjera omogućava `/me` da odbije opozvanu sesiju.
 
-Ovaj mali endpoint je konkretna credential-based opcija, ne WordPress core login API. Stavi ga samo na WordPress instancu kojoj vjeruješ, koristi HTTPS i rate limitiraj `/wp-json/headless/v1/login` na reverse proxyju/WAF: primjer koda namjerno ne implementira distribuirani rate limiter.
-
-```php
-<?php
-/**
- * Plugin Name: Headless Storefront Authentication
- */
-
-add_action('rest_api_init', function () {
-    register_rest_route('headless/v1', '/login', [
-        'methods'             => 'POST',
-        'permission_callback' => '__return_true',
-        'callback'            => function (WP_REST_Request $request) {
-            $params = $request->get_json_params();
-            $email_param = is_array($params) ? ($params['email'] ?? null) : null;
-            $password_param = is_array($params) ? ($params['password'] ?? null) : null;
-
-            if (
-                !is_string($email_param) ||
-                !is_string($password_param)
-            ) {
-                return new WP_Error(
-                    'invalid_credentials',
-                    'Invalid email or password.',
-                    ['status' => 401]
-                );
-            }
-
-            $email = sanitize_email($email_param);
-            if (
-                !$email ||
-                !is_email($email) ||
-                $password_param === '' ||
-                strlen($password_param) > 1024
-            ) {
-                return new WP_Error(
-                    'invalid_credentials',
-                    'Invalid email or password.',
-                    ['status' => 401]
-                );
-            }
-
-            $user = wp_authenticate($email, $password_param);
-            if (is_wp_error($user)) {
-                return new WP_Error(
-                    'invalid_credentials',
-                    'Invalid email or password.',
-                    ['status' => 401]
-                );
-            }
-
-            $allowed_roles = apply_filters(
-                'headless_storefront_login_allowed_roles',
-                ['customer', 'subscriber']
-            );
-            if (!array_intersect($allowed_roles, (array) $user->roles)) {
-                return new WP_Error(
-                    'invalid_credentials',
-                    'Invalid email or password.',
-                    ['status' => 401]
-                );
-            }
-
-            return new WP_REST_Response([
-                'id'           => (string) $user->ID,
-                'email'        => (string) $user->user_email,
-                'display_name' => (string) $user->display_name,
-            ], 200);
-        },
-    ]);
-});
-
-add_filter('rest_pre_serve_request', function ($served, $result, $request) {
-    if ($request->get_route() === '/headless/v1/login') {
-        header('Cache-Control: private, no-store');
-        header('Pragma: no-cache');
-    }
-    return $served;
-}, 10, 3);
-```
-
-Ovaj endpoint ne stvara WordPress browser cookie niti WooCommerce customer cart sesiju; samo provjerava lozinku i vraća identitet za Next.js session. Zadani allowlist prihvaća role `customer` i `subscriber`; promijeni ga kroz filter samo nakon odluke koji računi smiju u storefront. Ako WordPress konfiguracija ne dopušta prijavu emailom kroz `wp_authenticate`, prilagodi login funkciju i testiraj je na stvarnoj WP verziji. Nemoj slati password kroz URL ili log.
-
-**Datoteka: `apps/storefront/src/auth/wordpress.ts`**
-
-```ts
-import type { AppIdentity } from "./session";
-
-const endpoint = process.env.WP_HEADLESS_AUTH_URL;
-if (!endpoint || new URL(endpoint).protocol !== "https:") {
-  throw new Error("WP_HEADLESS_AUTH_URL must be configured with HTTPS");
-}
-
-export async function authenticateWithWordPress(
-  email: string,
-  password: string
-): Promise<AppIdentity | null> {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ email, password }),
-    cache: "no-store",
-    signal: AbortSignal.timeout(8_000),
-  });
-
-  if (response.status === 401) return null;
-  if (!response.ok) throw new Error("WordPress authentication unavailable");
-
-  const body: unknown = await response.json();
-  if (
-    typeof body !== "object" ||
-    body === null ||
-    typeof (body as Record<string, unknown>).id !== "string" ||
-    typeof (body as Record<string, unknown>).email !== "string" ||
-    typeof (body as Record<string, unknown>).display_name !== "string"
-  ) {
-    throw new Error("WordPress returned an invalid identity response");
-  }
-
-  const identity = body as {
-    id: string;
-    email: string;
-    display_name: string;
-  };
-  return {
-    subject: identity.id,
-    email: identity.email,
-    displayName: identity.display_name,
-  };
-}
-```
-
-**Datoteka: `apps/storefront/app/api/auth/login/route.ts`**
-
-```ts
-import { authenticateWithWordPress } from "@/auth/wordpress";
-import { createSession } from "@/auth/session";
-import {
-  downstreamError,
-  noStoreJson,
-  readJsonObject,
-  requireSameOrigin,
-} from "@/http/api";
-
-export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
-  const body = await readJsonObject(request);
-  const email = body?.email;
-  const password = body?.password;
-
-  if (
-    typeof email !== "string" ||
-    email.length > 254 ||
-    typeof password !== "string" ||
-    password.length === 0 ||
-    password.length > 1024
-  ) {
-    return noStoreJson({ error: "invalid_credentials" }, 400);
-  }
-
-  try {
-    const identity = await authenticateWithWordPress(email.trim(), password);
-    if (!identity) return noStoreJson({ error: "invalid_credentials" }, 401);
-    await createSession(identity);
-    return noStoreJson({
-      user: {
-        email: identity.email,
-        displayName: identity.displayName,
-      },
-    });
-  } catch (error) {
-    return downstreamError(error);
-  }
-}
-```
-
-Rate limiting mora se izvršavati prije slanja login pokušaja WordPressu (gateway/WAF ili shared store middleware) i na samom javno dostupnom WordPress login endpointu. Ne ograničavaj pokušaje samo u memoriji Next.js procesa jer više instanci ne dijeli stanje.
-
-**Datoteka: `apps/storefront/app/api/auth/me/route.ts`**
-
-```ts
-import { getSession } from "@/auth/session";
-import { noStoreJson } from "@/http/api";
-
-export async function GET() {
-  const user = await getSession();
-  if (!user) return noStoreJson({ user: null }, 401);
-  return noStoreJson({
-    user: { email: user.email, displayName: user.displayName },
-  });
-}
-```
-
-**Datoteka: `apps/storefront/app/api/auth/logout/route.ts`**
-
-```ts
-import { destroySession } from "@/auth/session";
-import { noStoreJson, requireSameOrigin } from "@/http/api";
-
-export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
-  await destroySession();
-  return noStoreJson({ success: true });
-}
-```
+`HEADLESS_AUTH_SECRET` mora biti ista nasumična tajna u storefront env-u i WordPress `wp-config.php`. `AUTH_SECRET` je opcionalna zasebna app JWT tajna. `HEADLESS_AUTH_URL` je plugin base URL; HTTP je dopušten samo za localhost/loopback u developmentu. Ako se `HEADLESS_AUTH_TRUST_PROXY=true`, proxy mora prepisivati `X-Real-IP`, a Next.js ne smije biti izravno dostupan klijentima. U WordPress pluginu ukloni `administrator` iz `ALLOWED_ROLES` prije staginga/produkcije.
 
 Ako odabereš OIDC, nemoj prilagođavati `authenticateWithWordPress` da prima korisničku lozinku. Umjesto toga dodaj `GET /api/auth/login` start rutu i `GET /api/auth/callback` s provider SDK-om; obavezno validiraj `state`, `nonce`, PKCE, issuer, audience, redirect URI i token signature. Točan kod ovisi o odabranom provideru/SDK-u i mora se izraditi prema njegovoj dokumentaciji.
 
@@ -1851,7 +1648,8 @@ import {
 import type { Address, CheckoutInput } from "@repo/commerce";
 
 function parseAddress(value: unknown): Address | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
   const address = value as Record<string, unknown>;
   const firstName = address.first_name;
   const lastName = address.last_name;
@@ -1915,7 +1713,8 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
   const body = await readJsonObject(request);
   const billingAddress = parseAddress(body?.billing_address);
   const shippingAddress = parseAddress(body?.shipping_address);
@@ -1956,7 +1755,10 @@ export async function POST(request: Request) {
         ? { expected_total: expectedTotal }
         : {}),
     };
-    const result = await commerce.submitCheckout(input, cart.cartToken ?? token);
+    const result = await commerce.submitCheckout(
+      input,
+      cart.cartToken ?? token,
+    );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
   } catch (error) {
@@ -1965,7 +1767,8 @@ export async function POST(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  if (!requireSameOrigin(request)) return noStoreJson({ error: "forbidden" }, 403);
+  if (!requireSameOrigin(request))
+    return noStoreJson({ error: "forbidden" }, 403);
   const body = await readJsonObject(request);
   const paymentMethod = body?.payment_method;
   const orderNotes = body?.order_notes;
@@ -1994,7 +1797,7 @@ export async function PUT(request: Request) {
         ...(paymentMethod ? { payment_method: paymentMethod } : {}),
         ...(typeof orderNotes === "string" ? { order_notes: orderNotes } : {}),
       },
-      cart.cartToken ?? token
+      cart.cartToken ?? token,
     );
     await writeCartToken(result.cartToken);
     return noStoreJson(result.data);
@@ -2045,7 +1848,9 @@ export function CheckoutForm() {
 
       const result: unknown = await response.json();
       if (!response.ok) {
-        setMessage("Narudžbu nije moguće poslati. Provjerite podatke i pokušajte ponovno.");
+        setMessage(
+          "Narudžbu nije moguće poslati. Provjerite podatke i pokušajte ponovno.",
+        );
         return;
       }
       const orderId =
@@ -2078,7 +1883,8 @@ export function CheckoutForm() {
         Poštanski broj <input name="postcode" required />
       </label>
       <label>
-        Država (ISO-3166-1 alpha-2) <input name="country" minLength={2} maxLength={2} required />
+        Država (ISO-3166-1 alpha-2){" "}
+        <input name="country" minLength={2} maxLength={2} required />
       </label>
       <label>
         Email <input name="email" type="email" required />
@@ -2115,7 +1921,7 @@ describe("storeApiRequest", () => {
           "Content-Type": "application/json",
           "Cart-Token": "rotated-token",
         },
-      })
+      }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -2189,6 +1995,6 @@ Sljedeće granice ne mogu biti univerzalno implementirane bez izbora dodatne teh
 2. **Customer cart** — način na koji WooCommerce dobiva provjeren WordPress customer identitet; Next.js app session i Cart-Token to ne uspostavljaju sami.
 3. **Kartično plaćanje** — browser SDK/tokenizacija i `payment_data` polja konkretnog gatewaya.
 4. **Webhook** — signature header/algoritam, replay protection i event model ovise o payment provideru.
-5. **Session revoke i shared rate limit** — zahtijevaju odabrani Redis/DB/WAF ili auth/session servis.
+5. **Instantni session revoke i login rate limit** — nisu dio stateless JWT implementacije; rate limit postaviti na WAF/proxyju, a per-token revoke zahtijeva budući server-side state ili auth/session servis.
 
 Za svaku od tih stavki napravi zaseban ADR u `docs/architecture/` i provider-specific contract/integration test. Nemoj zamijeniti nedostajući provider ugovor generičkim success responseom.
